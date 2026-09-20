@@ -1,0 +1,7 @@
+# 运行时产物：状态文件与审查报告不应提交
+.ad-review-loop/
+
+# 依赖与系统文件
+node_modules/
+.DS_Store
+*.log
