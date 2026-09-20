@@ -249,6 +249,25 @@ else {
   }
 }
 
+// ---------------------------------------------------------------- 文档与 CLI 的参数漂移
+
+{
+  const skillFile = join(ROOT, 'skills', 'ad-review-loop', 'SKILL.md')
+  const loopFile = join(ROOT, 'scripts', 'loop-state.mjs')
+  if (existsSync(skillFile) && existsSync(loopFile)) {
+    const skillText = readFileSync(skillFile, 'utf8')
+    const loopSrc = readFileSync(loopFile, 'utf8')
+    const used = new Set()
+    for (const block of [...skillText.matchAll(/```(?:bash|sh|jsonc?)?\r?\n([\s\S]*?)```/g)].map((m) => m[1])) {
+      if (!block.includes('loop-state.mjs')) continue
+      for (const m of block.matchAll(/--[a-z][\w-]*/g)) used.add(m[0])
+    }
+    const missing = [...used].filter((f) => !loopSrc.includes(f))
+    for (const f of missing) err(`SKILL.md 里用了 loop-state.mjs ${f}，但内核未实现该参数（文档与 CLI 漂移）`)
+    if (!missing.length) ok(`SKILL.md 引用的 ${used.size} 个内核参数均已实现`)
+  }
+}
+
 // ---------------------------------------------------------------- 插件内引用与脚本语法
 
 let refChecked = 0

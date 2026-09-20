@@ -11,6 +11,7 @@
  * 命令：
  *   init    <state>  --target <id> [--baseline <sha>] [--max-rounds 3] [--max-subagents 15]
  *                    [--verify-mode explicit|absence] [--stuck-after 2]
+ *                    [--reviewer-model <m> --fixer-model <m>]
  *   record  <state>  --round <n>          # 从 stdin 读 {"receipts":[],"findings":[]}
  *   resolve <state>  --id <F1> [--fix fixed|unfixed|false-positive] [--verify fixed|unfixed|disputed] [--note "..."]
  *   judge   <state>  [--json]
@@ -21,6 +22,11 @@
  *   absence  —— 无独立验证者的闭环（审查 → 修复 → 复审…）。缺席即通过：某条发现若"上一轮出现过"
  *               且"本轮未被复现"，且本轮审查者凭据覆盖了该发现的 lens，则判定为已修复。
  *               日后再次出现 → 内核按回归处理（R4 升级）。视角未覆盖时判定不应用，并留痕于该发现的 note。
+ *
+ * 模型声明（rules.models）：
+ *   可由用户对话式选定后写入（--reviewer-model / --fixer-model），也可留空表示"沿用 agents/ 的默认绑定"。
+ *   一旦声明：凭据里的 model 必须与之相等，否则该凭据被判为无效并留痕（不能"声称跨模型"却拿不出证据）；
+ *   且两者不得相同——跨模型是本模式的前提。judge 另会输出 degraded 信号（不改变判定，但报告必须呈现）。
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
@@ -89,6 +95,7 @@ export function createState({
   dedupeLines = 3,
   verifyMode = 'explicit',
   stuckAfterRounds = 2,
+  models = null,
 } = {}) {
   if (!target) throw new Error('init 需要 --target')
   if (!VERIFY_MODES.includes(verifyMode)) {
@@ -97,13 +104,26 @@ export function createState({
   if (!Number.isInteger(stuckAfterRounds) || stuckAfterRounds < 2) {
     throw new Error(`stuckAfterRounds 需为 ≥2 的整数，收到 ${stuckAfterRounds}`)
   }
+  if (models) {
+    const { reviewer, fixer } = models
+    if (typeof reviewer !== 'string' || !reviewer.trim() || typeof fixer !== 'string' || !fixer.trim()) {
+      throw new Error('声明模型时必须同时给出 reviewer 与 fixer（--reviewer-model / --fixer-model）')
+    }
+    if (reviewer === fixer) {
+      throw new Error(
+        `reviewer 与 fixer 不能是同一个模型（${reviewer}）——跨模型是本模式的前提。`
+        + '若确实要单模型，请改为沿用 agents/ 的默认绑定（不要传 --reviewer-model / --fixer-model），'
+        + '并在报告中声明"跨模型未达成"。',
+      )
+    }
+  }
   return {
     version: 1,
     target,
     baseline,
     createdAt: new Date().toISOString(),
     budget: { maxRounds, maxSubagents, subagentsUsed: 0 },
-    rules: { minConfidence, dedupeLines, verifyMode, stuckAfterRounds },
+    rules: { minConfidence, dedupeLines, verifyMode, stuckAfterRounds, models },
     seq: 0,
     findings: {},
     rounds: [],
@@ -130,14 +150,28 @@ export function recordRound(state, payload) {
 
   // 0) 凭据校验：无凭据不计入覆盖，也不计入预算（绝不静默）
   const rawReceipts = Array.isArray(payload.receipts) ? payload.receipts : []
+  const declared = state.rules.models
   const receipts = []
   for (const r of rawReceipts) {
-    if (validReceipt(r)) receipts.push(r)
-    else state.dropped.push({ round, reason: 'invalid-receipt', detail: r ?? null })
+    if (!validReceipt(r)) {
+      state.dropped.push({ round, reason: 'invalid-receipt', detail: r ?? null })
+      continue
+    }
+    // 已声明模型时，凭据必须拿出同样的模型——否则"跨模型"只是声称
+    const want = declared?.[r.role]
+    if (want && r.model !== want) {
+      state.dropped.push({
+        round,
+        reason: 'model-mismatch',
+        detail: { role: r.role, agentId: r.agentId, declared: want, got: r.model ?? null },
+      })
+      continue
+    }
+    receipts.push(r)
   }
   const invalidReceipts = rawReceipts.length - receipts.length
   if (invalidReceipts) {
-    notes.push(`丢弃 ${invalidReceipts} 份无效凭据（需 role ∈ ${VALID_ROLES.join('/')} + agentId + fresh=true），未计入预算与覆盖`)
+    notes.push(`丢弃 ${invalidReceipts} 份无效凭据（需 role ∈ ${VALID_ROLES.join('/')} + agentId + fresh=true${declared ? ' + model 与声明的角色模型一致' : ''}），未计入预算与覆盖`)
   }
 
   // 1) 归一 + 轮内去重
@@ -289,7 +323,7 @@ export function resolveFinding(state, { id, fix, verify, note } = {}) {
  *   hard-stop  — 硬停止（预算耗尽 / 达到 maxRounds 仍未收敛）
  *   continue   — 进入下一轮
  */
-export function judge(state) {
+function decide(state) {
   const rounds = state.rounds
   if (!rounds.length) {
     return { decision: 'continue', round: 0, reason: '尚未记录任何审查轮次；先执行第 1 轮审查。' }
@@ -394,6 +428,37 @@ export function judge(state) {
   }
 }
 
+/**
+ * 降级信号：不改变判定（审查本身仍有价值），但**报告必须呈现**——
+ * 否则就是"声称跨模型"却拿不出证据。
+ *   model-diversity —— 审查者与修复者观察到的模型相同
+ *   model-drift:<role> —— 同一角色跨轮出现多个不同模型（fallback / 白名单在悄悄换）
+ */
+function detectDegradation(state) {
+  const observed = new Map()
+  for (const r of state.rounds.flatMap((x) => x.receipts)) {
+    if (!r.model) continue
+    if (!observed.has(r.role)) observed.set(r.role, new Set())
+    observed.get(r.role).add(r.model)
+  }
+  const out = []
+  const reviewer = observed.get('reviewer')
+  const fixer = observed.get('fixer')
+  if (reviewer?.size === 1 && fixer?.size === 1 && [...reviewer][0] === [...fixer][0]) {
+    out.push('model-diversity')
+  }
+  for (const [role, set] of observed) {
+    if (set.size > 1) out.push(`model-drift:${role}`)
+  }
+  return out
+}
+
+export function judge(state) {
+  const verdict = decide(state)
+  const degraded = detectDegradation(state)
+  return degraded.length ? { ...verdict, degraded } : verdict
+}
+
 // ---------------------------------------------------------------- 摘要
 
 export function summarize(state) {
@@ -414,7 +479,9 @@ export function summarize(state) {
     bySeverity,
     unresolved: all.filter((f) => f.verify !== 'fixed' && rank(f.severity) >= BLOCKING_MIN).map((f) => f.id),
     verifiedByAbsence: all.filter((f) => f.closedBy?.rule === 'absence').map((f) => f.id),
-    models: [...new Set(state.rounds.flatMap((r) => r.receipts.map((x) => x.model).filter(Boolean)))],
+    modelsDeclared: state.rules.models ?? null,
+    modelsObserved: [...new Set(state.rounds.flatMap((r) => r.receipts.map((x) => x.model).filter(Boolean)))],
+    degraded: detectDegradation(state),
     regressed: all.filter((f) => f.regressed).map((f) => f.id),
     disputed: all.filter((f) => f.verify === 'disputed').map((f) => f.id),
     dropped: state.dropped.length,
@@ -484,6 +551,9 @@ function main() {
           dedupeLines: num(flags['dedupe-lines'], 3),
           verifyMode: flags['verify-mode'] ?? 'explicit',
           stuckAfterRounds: num(flags['stuck-after'], 2),
+          models: (flags['reviewer-model'] || flags['fixer-model'])
+            ? { reviewer: flags['reviewer-model'], fixer: flags['fixer-model'] }
+            : null,
         })
         save(statePath, state)
         console.log(`已初始化 ${statePath}`)
@@ -491,6 +561,9 @@ function main() {
         console.log(`  预算 maxRounds=${state.budget.maxRounds} maxSubagents=${state.budget.maxSubagents}`)
         console.log(`  规则 置信度阈值=${state.rules.minConfidence} 同问题行距=${state.rules.dedupeLines}`)
         console.log(`  验证模式=${state.rules.verifyMode} 卡住阈值=${state.rules.stuckAfterRounds} 轮`)
+        console.log(state.rules.models
+          ? `  模型 审查者=${state.rules.models.reviewer} 修复者=${state.rules.models.fixer}（凭据必须与之一致）`
+          : '  模型 (未声明，沿用 agents/ 的默认绑定)')
         break
       }
 
@@ -536,6 +609,9 @@ function main() {
           console.log(`${icon} decision = ${verdict.decision}`)
           console.log(`   ${verdict.reason}`)
           if (verdict.ids?.length) console.log(`   涉及：${verdict.ids.join(', ')}`)
+          if (verdict.degraded?.length) {
+            console.log(`   ⚠️ 降级信号：${verdict.degraded.join(', ')} —— 报告必须呈现，且不得声称"跨模型"`)
+          }
         }
         if (verdict.decision === 'escalate' || verdict.decision === 'hard-stop') process.exitCode = 1
         break

@@ -302,6 +302,76 @@ check('不同问题：不同文件', sameIssue(parseLocation('a.ts:10'), parseLo
   check('S18 拒绝未知 verifyMode', threw, true)
 }
 
+// ---------------------------------------------------------------- 场景 19：模型声明的合法性
+
+{
+  let same = false
+  try {
+    createState({ target: 'feat/m1', models: { reviewer: 'opus', fixer: 'opus' } })
+  } catch {
+    same = true
+  }
+  check('S19 拒绝两个角色同一模型', same, true)
+
+  let partial = false
+  try {
+    createState({ target: 'feat/m1', models: { reviewer: 'opus' } })
+  } catch {
+    partial = true
+  }
+  check('S19 拒绝只声明一个模型', partial, true)
+
+  const okState = createState({ target: 'feat/m1', models: { reviewer: 'opus', fixer: 'sonnet' } })
+  check('S19 合法声明写入 rules', okState.rules.models, { reviewer: 'opus', fixer: 'sonnet' })
+}
+
+// ---------------------------------------------------------------- 场景 20：凭据模型必须与声明一致
+
+{
+  const s = createState({ target: 'feat/m2', models: { reviewer: 'opus', fixer: 'sonnet' } })
+  recordRound(s, {
+    round: 1,
+    receipts: [
+      { role: 'reviewer', agentId: 'a1', fresh: true, lens: 'correctness', model: 'opus' },
+      { role: 'reviewer', agentId: 'a2', fresh: true, lens: 'security', model: 'haiku' }, // 与声明不符
+      { role: 'fixer', agentId: 'a3', fresh: true, model: 'sonnet' },
+    ],
+    findings: [],
+  })
+  check('S20 一致的凭据计入预算', s.budget.subagentsUsed, 2)
+  check('S20 不一致的凭据留痕', s.dropped.filter((d) => d.reason === 'model-mismatch').length, 1)
+  check('S20 留痕含声明值与实际值', s.dropped.find((d) => d.reason === 'model-mismatch').detail, {
+    role: 'reviewer', agentId: 'a2', declared: 'opus', got: 'haiku',
+  })
+}
+
+// ---------------------------------------------------------------- 场景 21：降级信号 —— 跨模型未达成
+
+{
+  const s = createState({ target: 'feat/m3' })
+  recordRound(s, {
+    round: 1,
+    receipts: [
+      { role: 'reviewer', agentId: 'a1', fresh: true, lens: 'correctness', model: 'opus' },
+      { role: 'fixer', agentId: 'a2', fresh: true, model: 'opus' },
+    ],
+    findings: [],
+  })
+  const v = judge(s)
+  check('S21 判定不变（仍 converge）', v.decision, 'converge')
+  check('S21 报 model-diversity', v.degraded, ['model-diversity'])
+}
+
+// ---------------------------------------------------------------- 场景 22：降级信号 —— 同一角色跨轮换模型
+
+{
+  const s = createState({ target: 'feat/m4' })
+  recordRound(s, { round: 1, receipts: [{ role: 'reviewer', agentId: 'a1', fresh: true, lens: 'correctness', model: 'opus' }], findings: [] })
+  recordRound(s, { round: 2, receipts: [{ role: 'reviewer', agentId: 'a2', fresh: true, lens: 'correctness', model: 'sonnet' }], findings: [] })
+  const v = judge(s)
+  check('S22 报 model-drift', v.degraded, ['model-drift:reviewer'])
+}
+
 // ---------------------------------------------------------------- 汇总
 
 console.log(`\n${pass} 通过，${fail} 失败`)

@@ -13,7 +13,7 @@ license: MIT
 ## 与前代设计的差异（三处，都是刻意的）
 
 1. **没有独立的"验证者"。** 下一轮的 fresh 审查者就是验证者：它重新审**当前完整 diff**，某条发现未被复现即判已修复（**缺席即通过**），被复现即判未修复。少一环，而且验证针对的是真实代码，而不是修复者的说法。
-2. **跨模型。** 审查者与修复者是两个不同的模型，绑定写在插件的 `agents/*.md` 里。编排者**不得**在 Agent 调用里传 `model` 参数——它优先级最高，会覆盖角色绑定（等于让被约束者自己挑约束）。
+2. **跨模型，且由用户选定。** 开跑前用对话式单选让用户为两个角色各选一个模型（见 0.2）。选择写进状态文件，并作为 `model` 参数传给子代理——**这是唯一允许传 `model` 的场景**，且值必须与状态文件一致（内核校验凭据，不一致即判无效并留痕）。用户选"默认"时沿用 `agents/*.md` 的绑定。
 3. **强制而非请求。** 审查者只读由 `tools` 白名单 + 插件级 `hooks/hooks.json` 双重强制；修复者的 commit / push / 破坏性命令由 hook 拦下。
 
 ```
@@ -60,9 +60,35 @@ license: MIT
 - 企业 `availableModels` 白名单 → 被挡的模型**静默回退**到 fallback（只在交互界面提示模型名）；
 - `fallbackModel` 链 → 过载时子代理会换模型继续。
 
-**派生凭据（强制）**：每个子代理必须产出一条可核验凭据：`role`（reviewer / fixer / verifier）、`agentId`、`provider`、`fresh`、`lens`、`model`。**无凭据或不完整的子代理视为未执行**——内核在 `record` 阶段丢弃并留痕，不计入预算与覆盖。
+**派生凭据（强制）**：每个子代理必须产出一条可核验凭据：`role`（reviewer / fixer / verifier）、`agentId`、`provider`、`fresh`、`lens`、`model`。**无凭据或不完整的子代理视为未执行**——内核在 `record` 阶段丢弃并留痕，不计入预算与覆盖。若已在 0.2 声明模型，凭据里的 `model` 必须与声明值一致，否则同样判为无效凭据。
 
-### 0.2 预算（**必须先算，不可省**）
+### 0.2 选择模型（**对话式，必做**）
+
+**先提问，不要替用户决定。** 用 `AskUserQuestion` 工具，两个问题各做一次单选：
+
+1. 「审查者（只读）用哪个模型？」
+2. 「修复者（可写）用哪个模型？」
+
+规则：
+
+- **选项 ≤4 个**，其余引导用户用 Other 输入完整模型 ID；
+- 两个答案**必须不同**。相同则说明理由并请其重选（跨模型是本插件的前提）；若用户坚持单模型，就**不要**写 `--reviewer-model/--fixer-model`，改用 `agents/` 的默认绑定，并在报告中声明「跨模型未达成」；
+- 结果写进状态文件（0.4 的 `init` 命令），派生时把同一个值通过 Agent 调用的 `model` 参数传给子代理；
+- 用户说"用默认"→ 不传任何模型参数，沿用 `agents/reviewer.md` 与 `agents/fixer.md` 的绑定；
+- **非交互场景**（`claude -p` 等无法提问）：读 `ADRL_REVIEWER_MODEL` / `ADRL_FIXER_MODEL`；两者都没有就用默认绑定，并在报告里注明「未能向用户确认模型」。
+
+**候选项从哪来**——无法编程枚举账户可用模型，这点要如实告诉用户：
+
+| 来源 | 例子 | 说明 |
+|---|---|---|
+| 文档化别名 | `opus` / `sonnet` / `haiku` / `fable` | **动态指针**：指向该 provider 的推荐版本，会随时间与组织白名单变化 |
+| 账户/网关 pin 出的完整 ID | `$ANTHROPIC_DEFAULT_HAIKU_MODEL` 的值、`claude-opus-5` | 想钉死版本就用这种 |
+| 当前会话模型 | `$ANTHROPIC_MODEL` 或 settings 里的 `model` | 至少保证"这个能用" |
+| 用户自定义 | 选项里的 Other | Bedrock inference profile ARN、Vertex 版本名、Foundry 部署名等 |
+
+给用户的选择建议：审查者是发现质量的主导者，值得配更强/更慢的模型；修复者配便宜快的。**要点是两者不同**——不同模型的价值在于盲点不相关，不必争论谁更强。
+
+### 0.3 预算（**必须先算，不可省**）
 
 | 预算项 | 默认值 | 说明 |
 |---|---|---|
@@ -73,15 +99,19 @@ license: MIT
 
 **峰值并发自检**：单轮峰值 = 审查者数 + 1。默认 5 视角时峰值 **6** < 默认上限 20 → ✅ 安全。
 
-### 0.3 建立基线
+### 0.4 建立基线
 
 ```bash
 mkdir -p .ad-review-loop
 node "${CLAUDE_PLUGIN_ROOT}/scripts/loop-state.mjs" init .ad-review-loop/<对象标识>-state.json \
   --target <分支名或对象标识> --baseline <commit 短 hash> \
   --max-rounds 3 --max-subagents 18 \
-  --verify-mode absence --stuck-after 2
+  --verify-mode absence --stuck-after 2 \
+  --reviewer-model <0.2 中用户选定的审查者模型> \
+  --fixer-model <0.2 中用户选定的修复者模型>
 ```
+
+用户选"默认"时，省略最后两行。**两个模型相同时 `init` 会直接报错**（跨模型是本模式的前提）；想跑单模型就不要传这两个参数。
 
 - `--verify-mode absence`：启用缺席即通过（本模式的必需项；缺省是 `explicit`，即必须由独立验证者确认）。
 - `--stuck-after 2`：同一发现连续 2 轮未解决即升级人工，不再自动重试。想多给修复者一次机会就设 3（并相应把 `--max-rounds` 提到 4）。
@@ -102,7 +132,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/loop-state.mjs" init .ad-review-loop/<对象
    - 分配视角、证据格式要求、凭据要求
    - "先陈述我理解的范围，再给发现"
 3. **所有审查者互不可见**，且**不告知上一轮的任何结论**——包括已修复项。fresh 的含义是彻底 fresh。
-4. **不要传 `model` 参数**，也不要传 `permissionMode`（插件子代理会忽略它，靠 `tools` 白名单即可）。
+4. **只传 0.2 中用户选定的那个模型**（`model` 参数）；用户选"默认"时**不要传**。除此之外不得传任何 `model` 值——它的优先级最高，会让角色绑定失效。也不要传 `permissionMode`（插件子代理会忽略它，靠 `tools` 白名单即可）。
 5. 每条发现必须带可点击位置：`<文件路径>:<起始行>-<结束行>`。**无位置的发现直接驳回**（内核会丢弃并留痕）。
 6. 给每个审查者一个 `name`（如 `rev-r1-correctness`），它就是凭据里的 `agentId`。
 
@@ -141,7 +171,7 @@ JSON
 ```
 
 - `receipts[].lens` 必须与分配的一致——内核靠它判断下一轮的视角覆盖。
-- `receipts[].model` 填 agent 定义里声明的模型；若从 `/tasks` 读到实际运行的模型不一致，**如实填写实际值并在报告中标注**。
+- `receipts[].model` 填 **0.2 里用户选定的模型**（必须与状态文件一致，否则内核判该凭据无效）；用户选"默认"时填 agent frontmatter 里的模型值。若从 `/tasks` 读到实际运行的模型与声明不符，**如实填写实际值并在报告中标注**。
 - 修复者的凭据与审查者同轮写入（修复发生在下一轮审查之前，但归属上一轮）。
 
 **不要手工做去重或 id 分配**——那正是确定性该覆盖的部分。内核的丢弃与合并全部留痕在 `state.dropped`，报告需呈现。
@@ -162,6 +192,8 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/loop-state.mjs" judge .ad-review-loop/<对�
 | `hard-stop` | 子代理预算耗尽 / 达到 `maxRounds` 仍未收敛 | 停止，如实报告未收敛 |
 
 **编排者不得覆盖内核判定。** 认为判定有误，是修改内核输入（发现数据），不是绕过它。
+
+**降级信号**：`judge` 输出里若带 `degraded`，说明跨模型并未真正成立——`model-diversity` 表示两个角色实测到同一个模型，`model-drift:<role>` 表示同一角色跨轮换了模型。判定结论不变（审查本身仍有价值），但**报告必须呈现，且不得声称"跨模型"**。
 
 另外三条**内核无法覆盖、需人工判断**的升级条件：
 
@@ -203,7 +235,8 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/loop-state.mjs" judge .ad-review-loop/<对�
 ## 2. 宿主能力与预算
 - 派生能力：Agent 工具，`ad-review-loop:reviewer` / `ad-review-loop:fixer`
 - 只读强制：tools 白名单 + 插件 hook（是否实测通过）
-- 跨模型：声明的两个模型 / 是否被 FORCE、availableModels、fallback 影响
+- 模型来源：用户选定（0.2 提问）/ 环境变量 / 默认绑定 / 未能确认
+- 跨模型：声明的两个模型 / 实测模型 / 是否出现 degraded 信号（FORCE、availableModels、fallback 都会静默抹平）
 - 确定性内核：已使用 / 手工降级
 - 预算：maxRounds=<n>，实际轮次=<n>，总子代理=<n>
 
@@ -246,7 +279,11 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/loop-state.mjs" judge .ad-review-loop/<对�
   "target": "feat/x",
   "baseline": "a1b2c3d",
   "budget": { "maxRounds": 3, "maxSubagents": 18, "subagentsUsed": 6 },
-  "rules": { "minConfidence": 70, "dedupeLines": 3, "verifyMode": "absence", "stuckAfterRounds": 2 },
+  "rules": {
+    "minConfidence": 70, "dedupeLines": 3,
+    "verifyMode": "absence", "stuckAfterRounds": 2,
+    "models": { "reviewer": "opus", "fixer": "sonnet" }   // 0.2 中用户选定；null = 沿用 agents/ 默认绑定
+  },
   "findings": {
     "F1": {
       "id": "F1", "lens": "correctness", "severity": "P1",
@@ -297,7 +334,9 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/loop-state.mjs" judge .ad-review-loop/<对�
 ## 反模式清单（明确禁止）
 
 - ❌ 编排者自己扮演审查者或修复者（违反不变量 1、2）
-- ❌ 在 Agent 调用里传 `model` 参数（覆盖角色绑定 = 运行时自选模型）
+- ❌ 替用户决定模型（跳过 0.2 的提问）
+- ❌ 在 Agent 调用里传 0.2 之外、或与状态文件不一致的 `model` 参数
+- ❌ 出现 `degraded` 信号却仍声称"跨模型"
 - ❌ 用 `/subtask` 或 fork 派生审查者（继承上下文 = 不是 fresh）
 - ❌ 复用上一轮的审查者，或把上一轮结论告知本轮的 fresh 审查者
 - ❌ 让审查者顺手修复，或让修复者审查自己的改动
@@ -316,9 +355,10 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/loop-state.mjs" judge .ad-review-loop/<对�
 
 ## 验证清单
 
+- [ ] 已用 0.2 的对话式单选让用户选定两个模型；结果与状态文件 `rules.models` 一致
 - [ ] 每个子代理都有完整凭据（role / agentId / provider / fresh / lens / model）；无凭据者未计入覆盖
 - [ ] 每轮审查者都是 fresh（非 fork、非 `/subtask`），且未被告知历史结论
-- [ ] 审查者与修复者是不同角色、不同模型、不同权限
+- [ ] 审查者与修复者是不同角色、不同模型、不同权限；`judge` 输出无 `degraded`
 - [ ] 审查者的 `tools` 白名单不含 Edit / Write / Bash；钩子实测拦下过一次写操作
 - [ ] 状态文件每轮重读 + 覆写；收敛判定引用了内核输出的原文
 - [ ] 跨轮视角集一致；缺席判定的依据在 `rounds[].notes` 里可见

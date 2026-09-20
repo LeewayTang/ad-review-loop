@@ -68,15 +68,23 @@ ad-review-loop/
 
 要求：**Node ≥ 18**（无第三方依赖，纯标准库）。`${CLAUDE_PLUGIN_ROOT}` 在插件内容里会被内联替换，所以协议文本里写 `node "${CLAUDE_PLUGIN_ROOT}/scripts/loop-state.mjs"` 是可靠的；注意它**不会**作为环境变量进入 Bash 工具，写成 shell 变量 `$CLAUDE_PLUGIN_ROOT` 无效。
 
-### 跨模型角色绑定
+### 模型选择：每次运行由用户在对话中选定
 
-`agents/reviewer.md` 与 `agents/fixer.md` 的 frontmatter 各钉一个模型，解析优先级是：
+插件不会替你决定模型。跑起来后它**先提问**，两问单选（选项 ≤4 个，其余用 Other 输入完整 ID）：
 
-**单次调用的 `model` 参数 > agent frontmatter > `CLAUDE_CODE_SUBAGENT_MODEL` > 主对话模型**
+```
+1. 审查者（只读）用哪个模型？   [ opus | sonnet | haiku | 自定义 ]
+2. 修复者（可写）用哪个模型？   [ sonnet | opus | haiku | 自定义 ]
+```
 
-所以协议里**明令禁止在 Agent 调用里传 `model`**——它优先级最高，会覆盖角色绑定（等于让被约束者自己挑约束）。改默认搭配只需改这两个文件里的一行。
+然后：选择 → 写入状态文件（`rules.models`）→ 派生时作为 `model` 参数传给子代理 → **内核校验凭据里的模型必须与声明一致**（不一致就判该凭据无效并留痕，不计入覆盖）。选了同一个模型 `init` 会直接报错——跨模型是这个模式的前提。
 
-只有两个模型可用时的推荐分配：审查者 = 强推理模型，修复者 = 便宜快的模型，**两者必须不同**（`npm run check` 会校验这一点）。
+- **候选项**：文档化别名（`opus`/`sonnet`/`haiku`/`fable`，是**动态指针**，随 provider 与白名单变化）、`ANTHROPIC_DEFAULT_*_MODEL` pin 出的完整 ID、当前会话模型、以及用户自填（Bedrock ARN / Vertex 版本名等）。**无法编程枚举账户可用模型**，这点在提问时会如实说明。
+- **非交互场景**（`claude -p`）：读 `ADRL_REVIEWER_MODEL` / `ADRL_FIXER_MODEL`；都没有则用默认绑定并在报告里注明"未能确认模型"。
+- **选"默认"**：不传任何模型参数，沿用 `agents/reviewer.md`（opus）与 `agents/fixer.md`（sonnet）的绑定。改默认搭配就是各改一行。
+- **不想要对话**：`agents/*.md` 的 frontmatter 是默认值；把 `model:` 改成你想要的即可（等价于永久选"默认"）。
+
+解析优先级须记住：**单次调用的 `model` 参数 > agent frontmatter > `CLAUDE_CODE_SUBAGENT_MODEL` > 主对话模型**。协议只允许传"用户刚选定的那个值"，其余一律禁止——它优先级最高，否则等于让被约束者自己挑约束。
 
 ### 强制级别（哪些是"强制"、哪些只是"请求"）
 
@@ -87,6 +95,7 @@ ad-review-loop/
 | 修复者不 commit / push / 改历史 | 同一个守卫脚本，识别破坏性命令并阻断 | 运行时 |
 | 编排者不 commit / push | 协议约束 + 报告核对 | **仅提示词**（见下方说明） |
 | fresh 独立上下文 | 宿主原语：非 fork 子代理不继承对话历史；协议禁止 `/subtask` 与 fork | 宿主 + 协议 |
+| 跨模型真的成立 | 内核：凭据模型必须等于用户选定值；`judge` 输出 `degraded` 信号 | 确定性 |
 | 收敛判定确定性 | 内核（56 项自测覆盖每条规则） | 确定性 |
 | 扁平结构（子代理不再派生） | 两个角色的 `disallowedTools` 都移除 `Agent` | 结构性 |
 
@@ -169,7 +178,12 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/loop-state.mjs" show .ad-review-loop/feat-x-
 | 企业 `availableModels` 白名单 | 被挡的模型**静默回退**到 fallback（只在交互界面提示模型名） |
 | `fallbackModel` 链 | 过载时子代理换模型继续，会话模型不变 |
 
-对策：派生凭据里必须如实填写 `model`（声明值；能从 `/tasks` 读到实际值就填实际值，不一致要在报告里标注）。`state.rounds[].receipts[].model` 可在 `show` 的 `models` 字段里汇总看到。
+对策（**两处是内核级强制，不是建议**）：
+
+1. 凭据里的 `model` 必须等于状态文件里为用户选定的值——不一致则**该凭据被判无效**（`dropped: model-mismatch`），不计入覆盖与预算；
+2. `judge` 会输出 **`degraded` 信号**：`model-diversity` 表示两个角色实测到同一个模型，`model-drift:<role>` 表示同一角色跨轮换了模型。判定结论不变，但报告必须呈现，**不得声称"跨模型"**。
+
+`show` 里可对照 `modelsDeclared`（用户选定）、`modelsObserved`（凭据实测）、`degraded` 三组字段；实际运行模型可用 `/tasks` 查。
 
 ---
 
