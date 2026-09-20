@@ -1,23 +1,23 @@
 {
   "name": "ad-review-loop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "宿主无关的对抗式审查循环：Agent Skill + 零依赖确定性内核",
+  "description": "Claude Code 插件：跨模型对抗式审查循环（审查 → 修复 → 复审，收敛由确定性内核判定）",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "test": "node scripts/selftest.mjs"
+    "test": "node scripts/selftest.mjs && node scripts/selftest-hook.mjs",
+    "check": "node scripts/plugin-check.mjs"
   },
   "keywords": [
-    "agent-skill",
+    "claude-code-plugin",
     "code-review",
     "adversarial-review",
+    "review-loop",
     "subagent",
-    "deepseek-harness",
-    "claude-code",
-    "codex"
+    "cross-model"
   ]
 }

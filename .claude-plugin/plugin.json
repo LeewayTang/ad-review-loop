@@ -1,0 +1,18 @@
+{
+  "name": "ad-review-loop",
+  "description": "对抗式审查循环：每轮由独立上下文的子代理审查与修复，收敛判定由确定性内核算出。审查者只读、修复者最小改动、绝不 commit。",
+  "author": {
+    "name": "leewaytang",
+    "email": "leewaytang@tencent.com"
+  },
+  "homepage": "https://github.com/LeewayTang/ad-review-loop",
+  "repository": "https://github.com/LeewayTang/ad-review-loop",
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "adversarial-review",
+    "review-loop",
+    "subagent",
+    "cross-model"
+  ]
+}

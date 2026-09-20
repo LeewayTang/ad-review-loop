@@ -10,10 +10,17 @@
  *
  * 命令：
  *   init    <state>  --target <id> [--baseline <sha>] [--max-rounds 3] [--max-subagents 15]
+ *                    [--verify-mode explicit|absence] [--stuck-after 2]
  *   record  <state>  --round <n>          # 从 stdin 读 {"receipts":[],"findings":[]}
  *   resolve <state>  --id <F1> [--fix fixed|unfixed|false-positive] [--verify fixed|unfixed|disputed] [--note "..."]
  *   judge   <state>  [--json]
  *   show    <state>
+ *
+ * 验证模式（rules.verifyMode）：
+ *   explicit —— 默认。修复结果必须由独立的验证者显式确认（--verify 缺省即判未修复）。
+ *   absence  —— 无独立验证者的闭环（审查 → 修复 → 复审…）。缺席即通过：某条发现若"上一轮出现过"
+ *               且"本轮未被复现"，且本轮审查者凭据覆盖了该发现的 lens，则判定为已修复。
+ *               日后再次出现 → 内核按回归处理（R4 升级）。视角未覆盖时判定不应用，并留痕于该发现的 note。
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
@@ -32,6 +39,29 @@ export const SEV_NAME = ['(空)', 'P2', 'P1', 'P0']
 
 const rank = (sev) => (sev in SEV_RANK ? SEV_RANK[sev] : BLOCKING_MIN)
 const sevName = (r) => SEV_NAME[r] ?? `rank${r}`
+
+/** 合法的子代理角色。凭据上的 role 必须落在其中，否则视为无效凭据。 */
+export const VALID_ROLES = ['reviewer', 'fixer', 'verifier']
+
+/** 验证模式：见文件头注释。 */
+export const VERIFY_MODES = ['explicit', 'absence']
+
+/**
+ * 凭据校验：role / agentId / fresh 三者齐备才算一条可核验凭据。
+ * 无凭据或凭据不完整者视为未执行——不计入覆盖，也不计入预算。
+ */
+export function validReceipt(r) {
+  return Boolean(
+    r && typeof r === 'object'
+      && typeof r.role === 'string' && VALID_ROLES.includes(r.role)
+      && typeof r.agentId === 'string' && r.agentId.trim()
+      && r.fresh === true,
+  )
+}
+
+const appendNote = (f, text) => {
+  f.note = f.note ? `${f.note} | ${text}` : text
+}
 
 /** 解析 `<文件路径>:<起始行>[-<结束行>]`。用贪婪匹配取最后一个冒号，兼容 Windows 路径。 */
 export function parseLocation(loc) {
@@ -57,15 +87,23 @@ export function createState({
   maxSubagents = 15,
   minConfidence = 70,
   dedupeLines = 3,
+  verifyMode = 'explicit',
+  stuckAfterRounds = 2,
 } = {}) {
   if (!target) throw new Error('init 需要 --target')
+  if (!VERIFY_MODES.includes(verifyMode)) {
+    throw new Error(`未知 verifyMode：${verifyMode}（可选 ${VERIFY_MODES.join(' / ')}）`)
+  }
+  if (!Number.isInteger(stuckAfterRounds) || stuckAfterRounds < 2) {
+    throw new Error(`stuckAfterRounds 需为 ≥2 的整数，收到 ${stuckAfterRounds}`)
+  }
   return {
     version: 1,
     target,
     baseline,
     createdAt: new Date().toISOString(),
     budget: { maxRounds, maxSubagents, subagentsUsed: 0 },
-    rules: { minConfidence, dedupeLines },
+    rules: { minConfidence, dedupeLines, verifyMode, stuckAfterRounds },
     seq: 0,
     findings: {},
     rounds: [],
@@ -88,7 +126,19 @@ export function recordRound(state, payload) {
 
   const tol = state.rules.dedupeLines
   const minConf = state.rules.minConfidence
-  const receipts = Array.isArray(payload.receipts) ? payload.receipts : []
+  const notes = []
+
+  // 0) 凭据校验：无凭据不计入覆盖，也不计入预算（绝不静默）
+  const rawReceipts = Array.isArray(payload.receipts) ? payload.receipts : []
+  const receipts = []
+  for (const r of rawReceipts) {
+    if (validReceipt(r)) receipts.push(r)
+    else state.dropped.push({ round, reason: 'invalid-receipt', detail: r ?? null })
+  }
+  const invalidReceipts = rawReceipts.length - receipts.length
+  if (invalidReceipts) {
+    notes.push(`丢弃 ${invalidReceipts} 份无效凭据（需 role ∈ ${VALID_ROLES.join('/')} + agentId + fresh=true），未计入预算与覆盖`)
+  }
 
   // 1) 归一 + 轮内去重
   const norm = []
@@ -168,10 +218,48 @@ export function recordRound(state, payload) {
     }
   }
 
+  // 3) 缺席即通过（仅 verifyMode='absence'；且必须有上一轮可比对）
+  const prev = state.rounds[state.rounds.length - 1]
+  if (state.rules.verifyMode === 'absence' && prev) {
+    const covered = new Set(
+      receipts
+        .filter((r) => r.role === 'reviewer' && typeof r.lens === 'string' && r.lens.trim())
+        .map((r) => r.lens),
+    )
+    const reported = new Set(findingIds)
+    const closed = []
+    const skipped = []
+    for (const f of Object.values(state.findings)) {
+      if (reported.has(f.id)) continue            // 本轮又被报出 → 未修复，走跨轮匹配分支
+      if (f.lastSeenRound !== prev.round) continue // 只处理"上一轮还出现过"的发现
+      if (f.verify === 'fixed') continue
+      if (!covered.size) {
+        skipped.push(`${f.id}(本轮无带 lens 的审查者凭据)`)
+        continue
+      }
+      if (!covered.has(f.lens)) {
+        // 视角未覆盖 → 缺席不构成证据。留痕并保持未修复（后续会触发 R5 升级，不静默）。
+        skipped.push(`${f.id}(本轮未覆盖 lens=${f.lens})`)
+        appendNote(f, `第 ${round} 轮未覆盖 lens=${f.lens}，缺席判定未应用`)
+        continue
+      }
+      f.fix = 'fixed'
+      f.verify = 'fixed'
+      f.closedBy = { round, rule: 'absence' }
+      appendNote(f, `第 ${round} 轮未被复现（缺席判定）；若后续轮次再次出现则记为回归`)
+      closed.push(f.id)
+    }
+    if (closed.length) {
+      notes.push(`缺席判定：${closed.join(', ')} 在本轮未被复现，判定为已修复`)
+    }
+    if (skipped.length) notes.push(`缺席判定未应用：${skipped.join(', ')}`)
+  }
+
   state.rounds.push({
     round,
     findingIds,
     receipts,
+    notes,
     recordedAt: new Date().toISOString(),
   })
   state.budget.subagentsUsed += receipts.length
@@ -253,14 +341,19 @@ export function judge(state) {
     }
   }
 
-  // R5 卡住：上一轮就存在且至今未修好
-  const stuck = active.filter((id) => F[id].firstSeenRound < curRound && F[id].verify !== 'fixed')
+  // R5 卡住：同一发现跨轮仍未解决，达到 stuckAfterRounds 阈值
+  const stuckAfter = state.rules.stuckAfterRounds ?? 2
+  const stuck = active.filter((id) => {
+    const f = F[id]
+    return f.verify !== 'fixed' && curRound - f.firstSeenRound + 1 >= stuckAfter
+  })
   if (stuck.length) {
+    const span = Math.max(...stuck.map((id) => curRound - F[id].firstSeenRound + 1))
     return {
       decision: 'escalate',
       round: curRound,
       ids: stuck,
-      reason: `连续 ${curRound - Math.min(...stuck.map((id) => F[id].firstSeenRound)) + 1} 轮未解决：${stuck
+      reason: `连续 ${span} 轮未解决（阈值 stuckAfterRounds=${stuckAfter}）：${stuck
         .map((id) => `${id}(${F[id].location})`)
         .join(', ')}。循环不收敛，升级人工。`,
     }
@@ -315,9 +408,13 @@ export function summarize(state) {
     maxRounds: state.budget.maxRounds,
     subagentsUsed: state.budget.subagentsUsed,
     maxSubagents: state.budget.maxSubagents,
+    verifyMode: state.rules.verifyMode,
+    stuckAfterRounds: state.rules.stuckAfterRounds,
     findings: all.length,
     bySeverity,
     unresolved: all.filter((f) => f.verify !== 'fixed' && rank(f.severity) >= BLOCKING_MIN).map((f) => f.id),
+    verifiedByAbsence: all.filter((f) => f.closedBy?.rule === 'absence').map((f) => f.id),
+    models: [...new Set(state.rounds.flatMap((r) => r.receipts.map((x) => x.model).filter(Boolean)))],
     regressed: all.filter((f) => f.regressed).map((f) => f.id),
     disputed: all.filter((f) => f.verify === 'disputed').map((f) => f.id),
     dropped: state.dropped.length,
@@ -325,6 +422,7 @@ export function summarize(state) {
       round: r.round,
       receipts: r.receipts.length,
       findings: r.findingIds.length,
+      notes: r.notes ?? [],
     })),
   }
 }
@@ -384,12 +482,15 @@ function main() {
           maxSubagents: num(flags['max-subagents'], 15),
           minConfidence: num(flags['min-confidence'], 70),
           dedupeLines: num(flags['dedupe-lines'], 3),
+          verifyMode: flags['verify-mode'] ?? 'explicit',
+          stuckAfterRounds: num(flags['stuck-after'], 2),
         })
         save(statePath, state)
         console.log(`已初始化 ${statePath}`)
         console.log(`  对象=${state.target} 基线=${state.baseline || '(未指定)'}`)
         console.log(`  预算 maxRounds=${state.budget.maxRounds} maxSubagents=${state.budget.maxSubagents}`)
         console.log(`  规则 置信度阈值=${state.rules.minConfidence} 同问题行距=${state.rules.dedupeLines}`)
+        console.log(`  验证模式=${state.rules.verifyMode} 卡住阈值=${state.rules.stuckAfterRounds} 轮`)
         break
       }
 
@@ -406,6 +507,7 @@ function main() {
         if (r.findingIds.length) console.log(`  ${r.findingIds.map((id) => `${id}[${state.findings[id].severity}] ${state.findings[id].location}`).join('\n  ')}`)
         const dropped = state.dropped.filter((d) => d.round === r.round)
         if (dropped.length) console.log(`  丢弃 ${dropped.length} 条（${[...new Set(dropped.map((d) => d.reason))].join(', ')}）`)
+        for (const n of r.notes ?? []) console.log(`  · ${n}`)
         break
       }
 

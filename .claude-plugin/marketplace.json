@@ -1,0 +1,26 @@
+{
+  "name": "ad-review-loop",
+  "owner": {
+    "name": "leewaytang",
+    "email": "leewaytang@tencent.com"
+  },
+  "description": "对抗式审查循环的 Claude Code 插件：审查（模型 A，只读）→ 修复（模型 B，最小改动）→ 复审，直到某一轮无阻塞性发现。",
+  "plugins": [
+    {
+      "name": "ad-review-loop",
+      "source": "./",
+      "description": "对代码变更执行迭代式对抗审查。每轮派生独立上下文的子代理：审查者只读、修复者最小改动；收敛判定由确定性内核算出，跨模型角色绑定写在 agents/ 里。",
+      "category": "development-workflow",
+      "license": "MIT",
+      "keywords": [
+        "code-review",
+        "adversarial-review",
+        "review-loop",
+        "cross-model"
+      ],
+      "skills": [
+        "./skills/ad-review-loop"
+      ]
+    }
+  ]
+}

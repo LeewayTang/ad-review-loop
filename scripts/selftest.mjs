@@ -211,6 +211,97 @@ check('不同问题：不同文件', sameIssue(parseLocation('a.ts:10'), parseLo
   check('S12 仅 nitpick / 理论风险 → converge', judge(s).decision, 'converge')
 }
 
+// ---------------------------------------------------------------- 场景 13：absence 模式 —— 缺席即通过
+
+{
+  const s = createState({ target: 'feat/n1', verifyMode: 'absence' })
+  recordRound(s, {
+    round: 1,
+    receipts: [receipt('reviewer', 'a1')],
+    findings: [R('correctness', 'P1', 'src/a.ts:10')],
+  })
+  check('S13 第1轮 → continue', judge(s).decision, 'continue')
+  recordRound(s, {
+    round: 2,
+    receipts: [{ role: 'reviewer', agentId: 'a2', provider: 'agent-tool', fresh: true, lens: 'correctness', model: 'opus' }],
+    findings: [],
+  })
+  check('S13 缺席 → 判定已修复', s.findings.F1.verify, 'fixed')
+  check('S13 留痕 closedBy', s.findings.F1.closedBy, { round: 2, rule: 'absence' })
+  check('S13 第2轮空 → converge', judge(s).decision, 'converge')
+  check('S13 轮次备注记录缺席判定', /缺席判定：F1/.test(s.rounds[1].notes.join(' ')), true)
+}
+
+// ---------------------------------------------------------------- 场景 14：absence 模式 —— 视角未覆盖则不关闭
+
+{
+  const s = createState({ target: 'feat/n2', verifyMode: 'absence' })
+  recordRound(s, {
+    round: 1,
+    receipts: [{ role: 'reviewer', agentId: 'a1', provider: 'agent-tool', fresh: true, lens: 'concurrency' }],
+    findings: [R('concurrency', 'P1', 'src/a.ts:10')],
+  })
+  recordRound(s, {
+    round: 2,
+    receipts: [{ role: 'reviewer', agentId: 'a2', provider: 'agent-tool', fresh: true, lens: 'correctness' }],
+    findings: [],
+  })
+  // 视角未覆盖 → 缺席不构成证据，保持 pending（既不判已修，也不静默通过）
+  check('S14 视角未覆盖 → 保持 pending', s.findings.F1.verify, 'pending')
+  check('S14 留痕说明未应用', /未覆盖 lens=concurrency/.test(s.findings.F1.note), true)
+}
+
+// ---------------------------------------------------------------- 场景 15：absence 关闭后重现 → 回归
+
+{
+  const s = createState({ target: 'feat/n3', verifyMode: 'absence', maxRounds: 5 })
+  const rev = (id, lens = 'correctness') => ({ role: 'reviewer', agentId: id, provider: 'agent-tool', fresh: true, lens })
+  recordRound(s, { round: 1, receipts: [rev('a1')], findings: [R('correctness', 'P1', 'src/a.ts:10')] })
+  recordRound(s, { round: 2, receipts: [rev('a2')], findings: [] })
+  check('S15 第2轮已判修复', s.findings.F1.fix, 'fixed')
+  recordRound(s, { round: 3, receipts: [rev('a3')], findings: [R('correctness', 'P1', 'src/a.ts:10')] })
+  const v = judge(s)
+  check('S15 回归 → escalate', v.decision, 'escalate')
+  check('S15 标记 regressed', s.findings.F1.regressed, true)
+}
+
+// ---------------------------------------------------------------- 场景 16：卡住阈值可调
+
+{
+  const s = createState({ target: 'feat/n4', stuckAfterRounds: 3, maxRounds: 5 })
+  recordRound(s, { round: 1, receipts: [receipt('reviewer', 'a1')], findings: [R('correctness', 'P1', 'src/a.ts:10')] })
+  recordRound(s, { round: 2, receipts: [receipt('reviewer', 'a2')], findings: [R('correctness', 'P1', 'src/a.ts:10')] })
+  check('S16 阈值 3 → 第2轮仍 continue', judge(s).decision, 'continue')
+  recordRound(s, { round: 3, receipts: [receipt('reviewer', 'a3')], findings: [R('correctness', 'P1', 'src/a.ts:10')] })
+  const v = judge(s)
+  check('S16 达阈值 → escalate', v.decision, 'escalate')
+  check('S16 理由含阈值', /stuckAfterRounds=3/.test(v.reason), true)
+}
+
+// ---------------------------------------------------------------- 场景 17：凭据校验
+
+{
+  const s = createState({ target: 'feat/n5' })
+  recordRound(s, { round: 1, receipts: [{ role: 'reviewer', agentId: 'a1', fresh: true }], findings: [] })
+  check('S17 有效凭据计入预算', s.budget.subagentsUsed, 1)
+  recordRound(s, { round: 2, receipts: [{ role: 'reviewer', agentId: 'a2' }], findings: [] })
+  check('S17 无效凭据不计入预算', s.budget.subagentsUsed, 1)
+  check('S17 无效凭据留痕', s.dropped.filter((d) => d.reason === 'invalid-receipt').length, 1)
+  check('S17 轮次备注记录丢弃', /丢弃 1 份无效凭据/.test(s.rounds[1].notes.join(' ')), true)
+}
+
+// ---------------------------------------------------------------- 场景 18：拒绝未知 verifyMode
+
+{
+  let threw = false
+  try {
+    createState({ target: 'feat/n6', verifyMode: 'bogus' })
+  } catch {
+    threw = true
+  }
+  check('S18 拒绝未知 verifyMode', threw, true)
+}
+
 // ---------------------------------------------------------------- 汇总
 
 console.log(`\n${pass} 通过，${fail} 失败`)
